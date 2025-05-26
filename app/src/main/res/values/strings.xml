@@ -1,3 +1,12 @@
 <resources>
     <string name="app_name">WiFiChatP2P</string>
+    <string name="connection_status">connection_status</string>
+    <string name="discover">discover</string>
+    <string name="on_off">on_off</string>
+    <string name="message">message</string>
+    <string name="message_info">message_info</string>
+    <string name="write_here">write_here</string>
+    <string name="send_message">send_message</string>
+    <string name="if_you_are_not_automatically_directed_to_the_main_screen_press_the_button_below">if_you_are_not_automatically_directed_to_the_main_screen_press_the_button_below</string>
+    <string name="go_to_main_screen">go_to_main_screen</string>
 </resources>
