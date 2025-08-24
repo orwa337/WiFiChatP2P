@@ -74,17 +74,18 @@
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintVertical_bias="0.199" />
 
-    <TextView
-        android:id="@+id/textViewMessage"
-        android:layout_width="390dp"
-        android:layout_height="170dp"
-        android:text="@string/message"
+    <ListView
+        android:id="@+id/listViewMessage"
+        android:layout_width="391dp"
+        android:layout_height="230dp"
+        android:background="#F5F5F5"
+        android:divider="@android:color/transparent"
+        android:dividerHeight="2dp"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintHorizontal_bias="0.476"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent"
-        app:layout_constraintVertical_bias="0.688" />
+        app:layout_constraintVertical_bias="0.804" />
 
     <EditText
         android:id="@+id/editTextMessage"

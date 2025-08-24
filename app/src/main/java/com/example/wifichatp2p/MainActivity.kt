@@ -25,8 +25,11 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import java.io.IOException
-import java.io.ObjectInputStream
-import java.io.ObjectOutputStream
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.io.PrintWriter
+import java.io.InputStream
+import java.nio.charset.StandardCharsets
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -37,6 +40,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import java.net.SocketTimeoutException
+import java.net.NetworkInterface
+import java.net.Inet4Address
 
 class MainActivity : AppCompatActivity() {
 
@@ -47,13 +52,17 @@ class MainActivity : AppCompatActivity() {
 
     // ========== UI ELEMENTS ==========
     lateinit var textViewConnectionStatus: TextView // Shows connection status
-    lateinit var textViewMessage: TextView          // Shows sent/received messages
+    lateinit var listViewMessage: ListView          // Shows sent/received messages
     lateinit var buttonSwitchWifi: Button           // Opens WiFi settings
     lateinit var buttonDiscover: Button             // Starts peer discovery
     lateinit var buttonDisconnect: Button           // Disconnects from peer
     lateinit var listViewPeers: ListView            // Lists discovered peers
     lateinit var editTextMessage: EditText          // Input field for messages
     lateinit var imageButtonSend: ImageButton       // Send message button
+
+    // ========== MESSAGE ADAPTER ==========
+    lateinit var messageAdapter: MessageAdapter     // Adapter for message ListView
+    private val messages = ArrayList<String>()       // List to store all chat messages
 
     // ========== WIFI P2P VARIABLES ==========
     lateinit var manager: WifiP2pManager            // Main WiFi P2P manager
@@ -70,8 +79,9 @@ class MainActivity : AppCompatActivity() {
     var isHost = false                                      // True if this device is the group owner
     private var socket: Socket? = null                      // Socket for communication
     private var serverSocket: ServerSocket? = null          // Server socket (for host only)
-    private var outputStream: ObjectOutputStream? = null    // Stream for sending data
-    private var inputStream: ObjectInputStream? = null      // Stream for receiving data
+    private var outputWriter: PrintWriter? = null           // Writer for sending data
+    private var inputReader: BufferedReader? = null         // Reader for receiving data (legacy - will be replaced)
+    private var inputStream: InputStream? = null            // Direct input stream for immediate reading
     private var isConnected = false                         // True if connected to a peer
 
     // ========== UI HANDLER ==========
@@ -79,6 +89,10 @@ class MainActivity : AppCompatActivity() {
 
     // ========== POWER MANAGEMENT ==========
     private lateinit var wakeLock: PowerManager.WakeLock    // Keeps device awake during connection
+
+    // ========== NETWORK INTERFACE MANAGEMENT ==========
+    private var wifiDirectInterface: NetworkInterface? = null
+    private var wifiDirectAddress: InetAddress? = null
 
     /**
      * Called when the activity is first created
@@ -101,13 +115,17 @@ class MainActivity : AppCompatActivity() {
      */
     private fun initializeViews() {
         textViewConnectionStatus = findViewById(R.id.textViewConnectionStatus)
-        textViewMessage = findViewById(R.id.textViewMessage)
+        listViewMessage = findViewById(R.id.listViewMessage)
         buttonSwitchWifi = findViewById(R.id.buttonSwitchWifi)
         buttonDiscover = findViewById(R.id.buttonDiscover)
         buttonDisconnect = findViewById(R.id.buttonDisconnect)
         listViewPeers = findViewById(R.id.listViewPeers)
         editTextMessage = findViewById(R.id.editTextMessage)
         imageButtonSend = findViewById(R.id.imageButtonSend)
+
+        // Initialize message adapter and set it to the ListView
+        messageAdapter = MessageAdapter(this, messages)
+        listViewMessage.adapter = messageAdapter
     }
 
     /**
@@ -149,7 +167,9 @@ class MainActivity : AppCompatActivity() {
 
         // Disconnect button - disconnects from the current peer
         buttonDisconnect.setOnClickListener {
-            closeConnection()
+            // Clear peers and chat
+            messages.clear()
+            disconnect()
         }
 
         // Peer list item click - connects to selected peer
@@ -277,6 +297,59 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * Find and configure the WiFi Direct network interface
+     * This ensures proper socket binding for P2P communication
+     */
+    private fun configureWifiDirectInterface(info: WifiP2pInfo) {
+        try {
+            // Reset previous interface info
+            wifiDirectInterface = null
+            wifiDirectAddress = null
+
+            // Get all network interfaces
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+
+            while (interfaces.hasMoreElements()) {
+                val networkInterface = interfaces.nextElement()
+
+                // Look for WiFi Direct interface (typically p2p-wlan0-X or similar)
+                if (networkInterface.name.contains("p2p") ||
+                    networkInterface.displayName.contains("p2p") ||
+                    networkInterface.name.contains("wlan") && networkInterface.isUp) {
+
+                    val addresses = networkInterface.inetAddresses
+                    while (addresses.hasMoreElements()) {
+                        val address = addresses.nextElement()
+
+                        // Look for IPv4 address in WiFi Direct range (192.168.49.x)
+                        if (address is Inet4Address && !address.isLoopbackAddress) {
+                            val hostAddr = address.hostAddress
+
+                            // WiFi Direct typically uses 192.168.49.x subnet
+                            if (hostAddr?.startsWith("192.168.49.") == true) {
+                                wifiDirectInterface = networkInterface
+                                wifiDirectAddress = address
+                                Log.d(TAG, "Found WiFi Direct interface: ${networkInterface.name} with IP: $hostAddr")
+                                return
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Fallback: if we're the group owner, use the group owner address
+            if (info.isGroupOwner && info.groupOwnerAddress != null) {
+                wifiDirectAddress = info.groupOwnerAddress
+                Log.d(TAG, "Using group owner address as fallback: ${info.groupOwnerAddress.hostAddress}")
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error configuring WiFi Direct interface: ${e.message}")
+            e.printStackTrace()
+        }
+    }
+
+    /**
      * Handle successful WiFi P2P connection
      * Determines if this device is host or client and starts appropriate role
      */
@@ -285,6 +358,14 @@ class MainActivity : AppCompatActivity() {
 
         // Clean up any existing connections before starting new one
         closeConnection()
+
+        // Configure WiFi Direct network interface for proper socket binding
+        configureWifiDirectInterface(info)
+
+        Log.d(TAG, "WiFi P2P Connection Info:")
+        Log.d(TAG, "  Group Formed: ${info.groupFormed}")
+        Log.d(TAG, "  Is Group Owner: ${info.isGroupOwner}")
+        Log.d(TAG, "  Group Owner Address: ${info.groupOwnerAddress?.hostAddress}")
 
         if (info.groupFormed && info.isGroupOwner) {
             // This device is the group owner (host)
@@ -351,22 +432,49 @@ class MainActivity : AppCompatActivity() {
     /**
      * Start server socket and wait for client connection
      * Called when this device is the group owner (host)
+     * Now properly binds to WiFi Direct interface for reliable P2P communication
      */
     private fun startServer() {
         try {
-            // Create server socket on specified port
-            serverSocket = ServerSocket(PORT)
-            updateStatus("Waiting for client...")
+            // Create server socket with explicit binding to WiFi Direct interface
+            serverSocket = if (wifiDirectAddress != null) {
+                // Bind to specific WiFi Direct interface address
+                Log.d(TAG, "Binding server to WiFi Direct address: ${wifiDirectAddress?.hostAddress}")
+                ServerSocket(PORT, 50, wifiDirectAddress)
+            } else {
+                // Fallback to default binding (listen on all interfaces)
+                Log.d(TAG, "Using default server socket binding")
+                ServerSocket(PORT)
+            }
+
+            // Set socket options for better P2P performance
+            serverSocket?.reuseAddress = true
+            serverSocket?.soTimeout = 0  // No timeout for accept() - wait indefinitely
+
+            val bindAddress = serverSocket?.inetAddress?.hostAddress ?: "unknown"
+            updateStatus("Server listening on: $bindAddress:$PORT")
+            Log.d(TAG, "Server socket bound to: $bindAddress:$PORT")
 
             // Wait for client to connect (blocking call)
             val client = serverSocket?.accept()
 
             if (client != null) {
                 socket = client
+
+                // Configure client socket for optimal P2P communication with minimal buffering
+                socket?.tcpNoDelay = true  // Disable Nagle's algorithm for immediate sending
+                socket?.keepAlive = true   // Enable keep-alive packets
+                socket?.soTimeout = 0      // No read timeout for continuous listening
+
+                // Reduce socket buffer sizes to minimize buffering delays
+                socket?.receiveBufferSize = 4096  // 4KB receive buffer
+                socket?.sendBufferSize = 4096     // 4KB send buffer
+
                 setupStreams()  // Initialize input/output streams
 
                 val clientAddress = client.inetAddress.hostAddress
                 updateStatus("Client connected: $clientAddress")
+                Log.d(TAG, "Client connected from: $clientAddress")
 
                 // Start listening for incoming messages
                 listenForMessages()
@@ -381,22 +489,53 @@ class MainActivity : AppCompatActivity() {
     /**
      * Connect to the host server
      * Called when this device is a client
+     * Now includes proper socket configuration for reliable P2P communication
      */
     private fun connectToServer(hostAddress: InetAddress) {
         try {
-            // Create client socket and connect to host
+            Log.d(TAG, "Attempting to connect to server: ${hostAddress.hostAddress}:$PORT")
+
+            // Create client socket with proper configuration
             socket = Socket()
-            socket?.connect(InetSocketAddress(hostAddress, PORT), 5000) // 5 second timeout
+
+            // Configure socket options before connecting
+            socket?.reuseAddress = true
+            socket?.tcpNoDelay = true  // Disable Nagle's algorithm for immediate sending
+            socket?.keepAlive = true   // Enable keep-alive packets
+
+            // If we have a WiFi Direct interface, bind the client socket to it
+            if (wifiDirectAddress != null && !isHost) {
+                try {
+                    // Bind client socket to WiFi Direct interface for proper routing
+                    socket?.bind(InetSocketAddress(wifiDirectAddress, 0))
+                    Log.d(TAG, "Client socket bound to WiFi Direct interface: ${wifiDirectAddress?.hostAddress}")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Could not bind client socket to WiFi Direct interface: ${e.message}")
+                    // Continue without binding - fallback to default routing
+                }
+            }
+
+            // Connect to the host with timeout
+            socket?.connect(InetSocketAddress(hostAddress, PORT), 10000) // 10 second timeout
 
             if (socket?.isConnected == true) {
+                // Configure socket after successful connection for immediate message delivery
+                socket?.soTimeout = 0      // No read timeout for continuous listening
+                socket?.tcpNoDelay = true  // Ensure TCP_NODELAY is set after connection
+
+                // Reduce socket buffer sizes to minimize buffering delays
+                socket?.receiveBufferSize = 4096  // 4KB receive buffer
+                socket?.sendBufferSize = 4096     // 4KB send buffer
+
                 setupStreams()  // Initialize input/output streams
-                updateStatus("Connected to server")
+                updateStatus("Connected to server: ${hostAddress.hostAddress}")
+                Log.d(TAG, "Successfully connected to server: ${hostAddress.hostAddress}:$PORT")
 
                 // Start listening for incoming messages
                 listenForMessages()
             }
         } catch (e: IOException) {
-            Log.e(TAG, "Client error: ${e.message}")
+            Log.e(TAG, "Client connection error: ${e.message}")
             e.printStackTrace()
             updateStatus("Connection error: ${e.message}")
         }
@@ -404,19 +543,24 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Initialize input and output streams for socket communication
-     * IMPORTANT: Output stream must be created first to avoid deadlock
+     * Using direct InputStream reading to eliminate BufferedReader delays
+     * This eliminates all buffering delays for immediate message delivery
      */
     private fun setupStreams() {
         try {
-            // Create output stream first (important for avoiding deadlock)
-            outputStream = ObjectOutputStream(socket?.getOutputStream())
-            outputStream?.flush()
+            Log.d(TAG, "Setting up direct streams for immediate socket communication")
 
-            // Then create input stream
-            inputStream = ObjectInputStream(socket?.getInputStream())
+            // Create PrintWriter for sending messages (auto-flush enabled)
+            outputWriter = PrintWriter(socket?.getOutputStream(), true)
+
+            // Use direct InputStream instead of BufferedReader to avoid buffering delays
+            inputStream = socket?.getInputStream()
+
+            // Keep BufferedReader as fallback (but we'll use direct InputStream in listener)
+            inputReader = BufferedReader(InputStreamReader(socket?.getInputStream()))
             isConnected = true
 
-            Log.d(TAG, "Streams initialized successfully")
+            Log.d(TAG, "Direct streams initialized successfully - ready for immediate communication")
         } catch (e: IOException) {
             Log.e(TAG, "Stream setup error: ${e.message}")
             e.printStackTrace()
@@ -425,37 +569,82 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Listen for incoming messages in a loop
-     * Runs in background thread to avoid blocking UI
+     * Listen for incoming messages using direct InputStream reading
+     * Eliminates BufferedReader delays for immediate message delivery
+     * Uses high-priority thread for minimal latency
      */
     @SuppressLint("SetTextI18n")
     private fun listenForMessages() {
-        try {
+        // Start a high-priority dedicated thread for immediate message listening
+        thread(start = true) {
+            // Set high thread priority for immediate message processing
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+            Log.d(TAG, "Starting high-priority message listener thread with direct InputStream")
+
+            // Buffer for reading bytes directly from InputStream
+            val buffer = ByteArray(1024)
+            val messageBuilder = StringBuilder()
+
             while (isConnected && socket?.isConnected == true) {
-                socket?.soTimeout = 30000 // 30 second timeout to prevent indefinite blocking
+                try {
+                    // Add timestamp for latency measurement
+                    val receiveStartTime = System.currentTimeMillis()
 
-                // Read incoming message (blocking call)
-                val message = inputStream?.readObject() as? String
+                    // Read bytes directly from InputStream (no buffering delays)
+                    val bytesRead = inputStream?.read(buffer)
 
-                if (message != null) {
-                    // Update UI on main thread
-                    handler.post {
-                        textViewMessage.text = "Them: $message"
+                    if (bytesRead != null && bytesRead > 0) {
+                        // Convert bytes to string immediately
+                        val chunk = String(buffer, 0, bytesRead, StandardCharsets.UTF_8)
+                        messageBuilder.append(chunk)
+
+                        // Process complete messages (ending with newline)
+                        var newlineIndex = messageBuilder.indexOf('\n')
+                        while (newlineIndex != -1) {
+                            val message = messageBuilder.substring(0, newlineIndex).trim()
+                            messageBuilder.delete(0, newlineIndex + 1)
+
+                            if (message.isNotEmpty()) {
+                                val receiveEndTime = System.currentTimeMillis()
+                                val latency = receiveEndTime - receiveStartTime
+                                Log.d(TAG, "Received message (${latency}ms latency): $message")
+
+                                // Update UI immediately on main thread
+                                handler.post {
+                                    messages.add("them: $message")
+                                    messageAdapter.notifyDataSetChanged()
+                                    listViewMessage.setSelection(messageAdapter.count - 1)
+                                }
+                            }
+
+                            newlineIndex = messageBuilder.indexOf('\n')
+                        }
+                    } else if (bytesRead == -1) {
+                        // End of stream - connection closed by peer
+                        Log.d(TAG, "End of stream - connection closed by peer")
+                        break
                     }
-                    Log.d(TAG, "Received: $message")
+
+                } catch (e: IOException) {
+                    // IOException usually means connection was closed
+                    Log.d(TAG, "Connection closed: ${e.message}")
+                    break
+
+                } catch (e: Exception) {
+                    // Handle any other unexpected errors
+                    Log.e(TAG, "Unexpected error in message listener: ${e.message}")
+                    e.printStackTrace()
+                    break
                 }
             }
-        } catch (e: SocketTimeoutException) {
-            // Timeout is normal - just continue listening
-            Log.d(TAG, "Socket timeout: ${e.message}")
-        } catch (e: Exception) {
-            Log.e(TAG, "Message listening error: ${e.message}")
-            e.printStackTrace()
 
-            // If still connected, this is an unexpected error
+            // Listening loop has ended
+            Log.d(TAG, "High-priority message listener thread ending")
+
+            // If we're still supposed to be connected, this is an unexpected disconnection
             if (isConnected) {
                 handler.post {
-                    Toast.makeText(this, "Connection lost", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "Connection lost", Toast.LENGTH_SHORT).show()
                 }
                 closeConnection()
             }
@@ -463,12 +652,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Send a text message to the connected peer
+     * Send a text message to the connected peer with immediate delivery
+     * Enhanced with latency measurement and forced flushing to eliminate delays
      * @param message The text message to send
      */
     @SuppressLint("SetTextI18n")
     private fun sendMessage(message: String) {
-        if (!isConnected || outputStream == null) {
+        if (!isConnected || outputWriter == null) {
+            Log.w(TAG, "Cannot send message - not connected or no output stream")
             handler.post {
                 Toast.makeText(this, "Not connected", Toast.LENGTH_SHORT).show()
             }
@@ -476,17 +667,30 @@ class MainActivity : AppCompatActivity() {
         }
 
         try {
-            // Send the message through output stream
-            outputStream?.writeObject(message)
-            outputStream?.flush()
+            val sendStartTime = System.currentTimeMillis()
+            Log.d(TAG, "Sending message with timestamp: $message")
+
+            // Send the message using PrintWriter with immediate flushing
+            outputWriter?.println(message)
+            outputWriter?.flush()  // Force immediate flush to eliminate send buffering
+
+            // Also flush the underlying OutputStream to ensure immediate network delivery
+            socket?.getOutputStream()?.flush()
+
+            val sendEndTime = System.currentTimeMillis()
+            val sendLatency = sendEndTime - sendStartTime
+            Log.d(TAG, "Message sent successfully (${sendLatency}ms): $message")
 
             // Update UI on main thread
             handler.post {
-                textViewMessage.text = "You: $message"
+                // Add sent message to the ListView
+                messages.add("you: $message")
+                messageAdapter.notifyDataSetChanged()
+                // Auto-scroll to the newest message
+                listViewMessage.setSelection(messageAdapter.count - 1)
                 editTextMessage.text.clear()  // Clear input field
             }
 
-            Log.d(TAG, "Sent: $message")
         } catch (e: IOException) {
             Log.e(TAG, "Send error: ${e.message}")
             e.printStackTrace()
@@ -503,34 +707,62 @@ class MainActivity : AppCompatActivity() {
     /**
      * Close all connection resources and reset connection state
      * Safe to call multiple times
+     * Enhanced to clean up WiFi Direct interface references
      */
     private fun closeConnection() {
+        Log.d(TAG, "Closing connection and cleaning up resources")
         isConnected = false
 
         try {
             // Close all streams and sockets
             socket?.close()
             serverSocket?.close()
-            outputStream?.close()
-            inputStream?.close()
+            outputWriter?.close()
+            inputReader?.close()
         } catch (e: IOException) {
             Log.e(TAG, "Close error: ${e.message}")
         } finally {
             // Reset all connection variables
-            //inputStream = null
-            //outputStream = null
-            //socket = null
-            //serverSocket = null
-
             isHost = false
             socket = null
             serverSocket = null
-            outputStream = null
-            inputStream = null
+            outputWriter = null
+            inputReader = null
             isConnected = false
+
+            // Clean up WiFi Direct interface references
+            wifiDirectInterface = null
+            wifiDirectAddress = null
+
+            Log.d(TAG, "All connection resources cleaned up")
         }
+
         // Update status display
         updateStatus(if (isHost) "Host (disconnected)" else "Client (disconnected)")
+
+    }
+
+    private fun disconnect() {
+
+        manager.cancelConnect(channel, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                // Disconnect successful
+                Log.d(TAG, "cancelConnect")
+            }
+            override fun onFailure(reason: Int) {
+                // Handle failure
+                Log.d(TAG, "Failure cancelConnect")
+            }
+        })
+        manager.removeGroup(channel, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.d(TAG, "removeGroup")
+            }
+            override fun onFailure(reason: Int) {
+                Log.d(TAG, "Failure removeGroup")
+            }
+        })
+        closeConnection()
     }
 
     /**

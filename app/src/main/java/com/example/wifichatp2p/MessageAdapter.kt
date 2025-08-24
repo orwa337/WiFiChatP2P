@@ -1,4 +1,3 @@
-
 package com.example.wifichatp2p
 
 import android.content.Context
