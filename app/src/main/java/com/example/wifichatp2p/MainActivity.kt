@@ -42,6 +42,8 @@ import android.os.PowerManager
 import java.net.SocketTimeoutException
 import java.net.NetworkInterface
 import java.net.Inet4Address
+import net.sharksystem.asap.ASAPEncounterConnectionType
+import java.io.File
 
 class MainActivity : AppCompatActivity() {
 
@@ -94,6 +96,10 @@ class MainActivity : AppCompatActivity() {
     private var wifiDirectInterface: NetworkInterface? = null
     private var wifiDirectAddress: InetAddress? = null
 
+    // ========== ASAP ENCOUNTER MANAGER ==========
+    private lateinit var encounterLayer: EncounterLayer    // ASAP EncounterManager wrapper
+    private var currentPeerAddress: String? = null         // Track current peer for encounter management
+
     /**
      * Called when the activity is first created
      * Sets up the UI, WiFi P2P, and checks system requirements
@@ -108,6 +114,10 @@ class MainActivity : AppCompatActivity() {
         setupButtonListeners()                  // Set up button click handlers
         checkWifiAndLocation()                  // Check if WiFi and location are enabled
         requestBatteryOptimizationExemption()   // Request to ignore battery optimization
+        initializeEncounterManager()            // Initialize ASAP EncounterManager
+
+        // Start background encounter management service
+        EncounterManagerService.startService(this)
     }
 
     /**
@@ -146,6 +156,42 @@ class MainActivity : AppCompatActivity() {
             addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)         // WiFi P2P enabled/disabled
             addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)         // Peer list changed
             addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)    // Connection status changed
+        }
+    }
+
+    /**
+     * Initialize ASAP EncounterManager
+     * This sets up the encounter management layer that will control connection decisions
+     */
+    private fun initializeEncounterManager() {
+        try {
+            Log.d(TAG, "Initializing ASAP EncounterManager")
+
+            // Create unique peer ID based on device info
+            val deviceId = android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID)
+            val peerId = "WiFiP2P_$deviceId"
+
+            // Create storage folder for ASAP data
+            val storageFolder = File(filesDir, "asap_storage")
+
+            // Initialize encounter layer with 5-second cooldown
+            encounterLayer = EncounterLayer(peerId, storageFolder, 5000L)
+
+            val initSuccess = encounterLayer.initialize()
+            if (initSuccess) {
+                Log.i(TAG, "ASAP EncounterManager initialized successfully")
+                Log.d(TAG, "Peer ID: $peerId")
+                Log.d(TAG, "Storage: ${storageFolder.absolutePath}")
+                updateStatus("EncounterManager ready")
+            } else {
+                Log.e(TAG, "Failed to initialize ASAP EncounterManager")
+                updateStatus("EncounterManager failed to initialize")
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error initializing EncounterManager: ${e.message}")
+            e.printStackTrace()
+            updateStatus("EncounterManager error: ${e.message}")
         }
     }
 
@@ -266,21 +312,46 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Connect to a selected peer device
+     * Now includes ASAP EncounterManager decision logic
      * @param position Index of the device in the peers list
      */
     @SuppressLint("MissingPermission")
     private fun connectToDevice(position: Int) {
         val device = devices[position]
+        val deviceAddress = device.deviceAddress
+
+        Log.d(TAG, "Attempting to connect to device: ${device.deviceName} ($deviceAddress)")
+
+        // Check with ASAP EncounterManager if we should establish this connection
+        val shouldConnect = if (::encounterLayer.isInitialized) {
+            encounterLayer.shouldCreateConnection(deviceAddress, ASAPEncounterConnectionType.AD_HOC_LAYER_2_NETWORK)
+        } else {
+            Log.w(TAG, "EncounterLayer not initialized, proceeding with connection")
+            true
+        }
+
+        if (!shouldConnect) {
+            Log.i(TAG, "EncounterManager rejected connection to $deviceAddress (cooldown period active)")
+            updateStatus("Connection blocked - recent encounter with ${device.deviceName}")
+            return
+        }
+
+        Log.i(TAG, "EncounterManager approved connection to $deviceAddress")
+        currentPeerAddress = deviceAddress
+
         val config = WifiP2pConfig()
-        config.deviceAddress = device.deviceAddress
+        config.deviceAddress = deviceAddress
 
         manager.connect(channel, config, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                updateStatus("Connecting to: ${device.deviceAddress}")
+                Log.d(TAG, "WiFi P2P connect request successful for $deviceAddress")
+                updateStatus("Connecting to: ${device.deviceName}")
             }
 
             override fun onFailure(reason: Int) {
+                Log.e(TAG, "WiFi P2P connect request failed for $deviceAddress, reason: $reason")
                 updateStatus("Connection failed. Reason: $reason")
+                currentPeerAddress = null
             }
         })
     }
@@ -288,11 +359,24 @@ class MainActivity : AppCompatActivity() {
     /**
      * Update the connection status display
      * Called from both main thread and broadcast receiver
+     * Now includes EncounterManager status information
      */
     fun updateStatus(status: String) {
         handler.post {
-            textViewConnectionStatus.text = status
+            val enhancedStatus = if (::encounterLayer.isInitialized) {
+                "$status | ${encounterLayer.getStatus()}"
+            } else {
+                "$status | EncounterMgr: Not initialized"
+            }
+
+            textViewConnectionStatus.text = enhancedStatus
             Log.d(TAG, "Status: $status")
+
+            // Log detailed EncounterManager info
+            if (::encounterLayer.isInitialized) {
+                Log.d(TAG, "EncounterManager Status: ${encounterLayer.getStatus()}")
+                Log.v(TAG, "Active Connections Info:\n${encounterLayer.getActiveConnectionsInfo()}")
+            }
         }
     }
 
@@ -403,26 +487,58 @@ class MainActivity : AppCompatActivity() {
     /**
      * Listener for when the peer list is updated
      * Updates the UI with discovered devices
+     * Now includes EncounterManager filtering for available peers
      */
     val peerListListener = WifiP2pManager.PeerListListener { peerList ->
         val deviceList = peerList.deviceList
         if (deviceList.isNotEmpty()) {
+            Log.d(TAG, "Discovered ${deviceList.size} peers, filtering through EncounterManager")
+
             // Clear old peers and add new ones
             peers.clear()
             peers.addAll(deviceList)
 
-            // Create arrays for ListView adapter
-            devicesNames = Array(deviceList.size) { i ->
-                deviceList.elementAt(i).deviceName ?: "Unknown Device"
+            // Filter devices through EncounterManager if initialized
+            val availableDevices = if (::encounterLayer.isInitialized) {
+                deviceList.filter { device ->
+                    val shouldShow = encounterLayer.shouldCreateConnection(
+                        device.deviceAddress,
+                        ASAPEncounterConnectionType.AD_HOC_LAYER_2_NETWORK
+                    )
+
+                    if (shouldShow) {
+                        Log.d(TAG, "EncounterManager: Showing peer ${device.deviceName} (${device.deviceAddress})")
+                    } else {
+                        Log.d(TAG, "EncounterManager: Hiding peer ${device.deviceName} (${device.deviceAddress}) - cooldown active")
+                    }
+
+                    shouldShow
+                }
+            } else {
+                Log.w(TAG, "EncounterLayer not initialized, showing all peers")
+                deviceList.toList()
             }
 
-            devices = deviceList.toTypedArray()
+            // Create arrays for ListView adapter with filtered devices
+            devicesNames = Array(availableDevices.size) { i ->
+                availableDevices[i].deviceName ?: "Unknown Device"
+            }
+
+            devices = availableDevices.toTypedArray()
+
+            Log.i(TAG, "Showing ${availableDevices.size} of ${deviceList.size} discovered peers after EncounterManager filtering")
 
             // Update ListView on main thread
             handler.post {
                 val adapter = ArrayAdapter(applicationContext,
                     android.R.layout.simple_list_item_1, devicesNames)
                 listViewPeers.adapter = adapter
+
+                if (availableDevices.isEmpty() && deviceList.isNotEmpty()) {
+                    updateStatus("${deviceList.size} peers found, but all in cooldown period")
+                } else {
+                    updateStatus("${availableDevices.size} peers available")
+                }
             }
         } else {
             updateStatus("No devices found")
@@ -544,23 +660,46 @@ class MainActivity : AppCompatActivity() {
     /**
      * Initialize input and output streams for socket communication
      * Using direct InputStream reading to eliminate BufferedReader delays
-     * This eliminates all buffering delays for immediate message delivery
+     * Now integrates with ASAP EncounterManager to handle the encounter
      */
     private fun setupStreams() {
         try {
             Log.d(TAG, "Setting up direct streams for immediate socket communication")
 
-            // Create PrintWriter for sending messages (auto-flush enabled)
-            outputWriter = PrintWriter(socket?.getOutputStream(), true)
+            // Get input and output streams from socket
+            val inputStream = socket?.getInputStream()
+            val outputStream = socket?.getOutputStream()
 
-            // Use direct InputStream instead of BufferedReader to avoid buffering delays
-            inputStream = socket?.getInputStream()
+            if (inputStream != null && outputStream != null) {
+                // Create PrintWriter for sending messages (auto-flush enabled)
+                outputWriter = PrintWriter(outputStream, true)
 
-            // Keep BufferedReader as fallback (but we'll use direct InputStream in listener)
-            inputReader = BufferedReader(InputStreamReader(socket?.getInputStream()))
-            isConnected = true
+                // Use direct InputStream instead of BufferedReader to avoid buffering delays
+                this.inputStream = inputStream
 
-            Log.d(TAG, "Direct streams initialized successfully - ready for immediate communication")
+                // Keep BufferedReader as fallback (but we'll use direct InputStream in listener)
+                inputReader = BufferedReader(InputStreamReader(inputStream))
+                isConnected = true
+
+                Log.d(TAG, "Direct streams initialized successfully - ready for immediate communication")
+
+                // Notify ASAP EncounterManager about the new encounter
+                if (::encounterLayer.isInitialized && currentPeerAddress != null) {
+                    Log.d(TAG, "Notifying EncounterManager about new encounter with $currentPeerAddress")
+                    encounterLayer.handleEncounter(
+                        inputStream,
+                        outputStream,
+                        currentPeerAddress!!,
+                        ASAPEncounterConnectionType.AD_HOC_LAYER_2_NETWORK
+                    )
+                    Log.i(TAG, "EncounterManager notified about encounter with $currentPeerAddress")
+                } else {
+                    Log.w(TAG, "Cannot notify EncounterManager - layer not initialized or no peer address")
+                }
+            } else {
+                throw IOException("Failed to get input/output streams from socket")
+            }
+
         } catch (e: IOException) {
             Log.e(TAG, "Stream setup error: ${e.message}")
             e.printStackTrace()
@@ -707,11 +846,17 @@ class MainActivity : AppCompatActivity() {
     /**
      * Close all connection resources and reset connection state
      * Safe to call multiple times
-     * Enhanced to clean up WiFi Direct interface references
+     * Enhanced to clean up WiFi Direct interface references and notify EncounterManager
      */
     private fun closeConnection() {
         Log.d(TAG, "Closing connection and cleaning up resources")
         isConnected = false
+
+        // Notify EncounterManager about connection closure
+        if (::encounterLayer.isInitialized && currentPeerAddress != null) {
+            Log.d(TAG, "Notifying EncounterManager about connection closure with $currentPeerAddress")
+            encounterLayer.onConnectionClosed(currentPeerAddress!!)
+        }
 
         try {
             // Close all streams and sockets
@@ -734,12 +879,14 @@ class MainActivity : AppCompatActivity() {
             wifiDirectInterface = null
             wifiDirectAddress = null
 
+            // Reset peer tracking
+            currentPeerAddress = null
+
             Log.d(TAG, "All connection resources cleaned up")
         }
 
         // Update status display
         updateStatus(if (isHost) "Host (disconnected)" else "Client (disconnected)")
-
     }
 
     private fun disconnect() {
@@ -799,7 +946,21 @@ class MainActivity : AppCompatActivity() {
      */
     override fun onDestroy() {
         super.onDestroy()
+
+        Log.d(TAG, "MainActivity being destroyed - cleaning up resources")
+
+        // Clean up EncounterManager
+        if (::encounterLayer.isInitialized) {
+            Log.d(TAG, "Cleaning up EncounterLayer")
+            encounterLayer.cleanup()
+        }
+
+        // Stop background service
+        EncounterManagerService.stopService(this)
+
         disableWifiPowerSaving()
         closeConnection()
+
+        Log.d(TAG, "MainActivity cleanup completed")
     }
 }

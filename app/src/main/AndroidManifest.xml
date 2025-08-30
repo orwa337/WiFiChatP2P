@@ -22,6 +22,10 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- ASAP EncounterManager background service permissions -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -44,6 +48,13 @@
         <activity
             android:name=".MainActivity"
             android:exported="false" />
+
+        <!-- ASAP EncounterManager background service -->
+        <service
+                android:name=".EncounterManagerService"
+                android:enabled="true"
+                android:exported="false"
+                android:foregroundServiceType="dataSync" />
     </application>
 
 </manifest>
