@@ -1,5 +1,5 @@
 # WiFiChatP2P
-This is an Android chat app passed on Wi-Fi Driect \
+This is an Android chat app passed on Wi-Fi Driect 
 
 <p align="center">
   <img src="images/Screenshot_WiFiChatP2P.jpg" alt="Screen shot" />
