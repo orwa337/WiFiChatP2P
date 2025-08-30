@@ -1,8 +1,9 @@
 # WiFiChatP2P
 This is an Android chat app passed on Wi-Fi Driect \
 
-**Align center:**
-![Screen shot](images/Screenshot_WiFiChatP2P.jpg) 
+<p align="center">
+  <img src="images/Screenshot_WiFiChatP2P.jpg" alt="Screen shot" />
+</p>
 
 Open Bugs:
 
