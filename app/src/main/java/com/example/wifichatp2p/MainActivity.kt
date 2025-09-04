@@ -3,6 +3,7 @@ package com.example.wifichatp2p
 import android.annotation.SuppressLint
 import android.app.AlertDialog
 import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.net.wifi.WifiManager
@@ -44,6 +45,11 @@ import java.net.NetworkInterface
 import java.net.Inet4Address
 import net.sharksystem.asap.ASAPEncounterConnectionType
 import java.io.File
+import android.content.pm.PackageManager
+import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.min
 
 class MainActivity : AppCompatActivity() {
 
@@ -51,6 +57,8 @@ class MainActivity : AppCompatActivity() {
         private const val TAG = "MainActivity"
         private const val PORT = 8888 // Port number for socket communication
     }
+
+    private val deviceTag = "${TAG}_${Build.MANUFACTURER}_${Build.MODEL}"
 
     // ========== UI ELEMENTS ==========
     lateinit var textViewConnectionStatus: TextView // Shows connection status
@@ -100,6 +108,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var encounterLayer: EncounterLayer    // ASAP EncounterManager wrapper
     private var currentPeerAddress: String? = null         // Track current peer for encounter management
 
+    // ========== DEVICE-SPECIFIC CONFIGURATION ==========
+    private val isAsapInitialized = AtomicBoolean(false)
+    private val initializationMutex = kotlinx.coroutines.sync.Mutex()
+    private var devicePowerManager: PowerManager? = null
+
     /**
      * Called when the activity is first created
      * Sets up the UI, WiFi P2P, and checks system requirements
@@ -109,8 +122,13 @@ class MainActivity : AppCompatActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(R.layout.activity_main)
 
+        // Log device information for debugging
+        DeviceUtils.logDeviceInfo()
+        Log.d(deviceTag, "MainActivity onCreate - Device: ${Build.MANUFACTURER} ${Build.MODEL}")
+
         initializeViews()                       // Set up UI elements
         setupWifiP2p()                          // Initialize WiFi P2P components
+        setupPowerManagement()                  // Setup power management for different devices
         setupButtonListeners()                  // Set up button click handlers
         checkWifiAndLocation()                  // Check if WiFi and location are enabled
         requestBatteryOptimizationExemption()   // Request to ignore battery optimization
@@ -148,6 +166,9 @@ class MainActivity : AppCompatActivity() {
         // Initialize communication channel
         channel = manager.initialize(this, mainLooper, null)
 
+        // Initialize power manager for device-specific optimizations
+        devicePowerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+
         // Create broadcast receiver to handle WiFi P2P events
         receiver = WifiDirectBroadcastReceiver(manager, channel, this)
 
@@ -156,6 +177,36 @@ class MainActivity : AppCompatActivity() {
             addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)         // WiFi P2P enabled/disabled
             addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)         // Peer list changed
             addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)    // Connection status changed
+        }
+    }
+
+    /**
+     * Setup power management optimizations for different device types
+     */
+    private fun setupPowerManagement() {
+        try {
+            Log.d(deviceTag, "Setting up power management optimizations")
+
+            when (DeviceUtils.getDeviceManufacturer()) {
+                DeviceUtils.DeviceManufacturer.GOOGLE_PIXEL -> {
+                    Log.d(deviceTag, "Applying Pixel-specific power optimizations")
+                    // Pixel-specific optimizations will be handled in requestBatteryOptimizationExemption
+                }
+                DeviceUtils.DeviceManufacturer.SAMSUNG -> {
+                    Log.d(deviceTag, "Applying Samsung-specific power optimizations")
+                    // Samsung devices typically handle power management well by default
+                }
+                else -> {
+                    Log.d(deviceTag, "Applying default power optimizations")
+                }
+            }
+
+            // Common power optimizations for all devices
+            disableWifiPowerSaving()
+
+        } catch (e: Exception) {
+            Log.e(deviceTag, "Error setting up power management: ${e.message}")
+            e.printStackTrace()
         }
     }
 
@@ -174,18 +225,22 @@ class MainActivity : AppCompatActivity() {
             // Create storage folder for ASAP data
             val storageFolder = File(filesDir, "asap_storage")
 
-            // Initialize encounter layer with 5-second cooldown
-            encounterLayer = EncounterLayer(peerId, storageFolder, 5000L)
+            // Initialize encounter layer with device-specific cooldown and delay
+            encounterLayer = EncounterLayer(peerId, storageFolder, 5000L, DeviceUtils.getAsapInitDelay())
 
-            val initSuccess = encounterLayer.initialize()
-            if (initSuccess) {
-                Log.i(TAG, "ASAP EncounterManager initialized successfully")
-                Log.d(TAG, "Peer ID: $peerId")
-                Log.d(TAG, "Storage: ${storageFolder.absolutePath}")
-                updateStatus("EncounterManager ready")
-            } else {
-                Log.e(TAG, "Failed to initialize ASAP EncounterManager")
-                updateStatus("EncounterManager failed to initialize")
+            // Use async initialization with device-specific handling
+            encounterLayer.initializeAsync { initSuccess ->
+                if (initSuccess) {
+                    Log.i(deviceTag, "ASAP EncounterManager initialized successfully")
+                    Log.d(deviceTag, "Peer ID: $peerId")
+                    Log.d(deviceTag, "Storage: ${storageFolder.absolutePath}")
+                    isAsapInitialized.set(true)
+                    updateStatus("EncounterManager ready")
+                } else {
+                    Log.e(deviceTag, "Failed to initialize ASAP EncounterManager")
+                    isAsapInitialized.set(false)
+                    updateStatus("EncounterManager failed to initialize")
+                }
             }
 
         } catch (e: Exception) {
@@ -286,12 +341,37 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Request exemption from battery optimization to maintain connection
+     * Enhanced with device-specific handling for Pixel devices
      */
     private fun requestBatteryOptimizationExemption() {
-        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
-        intent.data = Uri.parse("package:$packageName")
-        startActivity(intent)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+                val packageName = packageName
 
+                if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
+                    Log.d(deviceTag, "Requesting battery optimization exemption")
+
+                    when (DeviceUtils.getDeviceManufacturer()) {
+                        DeviceUtils.DeviceManufacturer.GOOGLE_PIXEL -> {
+                            Log.d(deviceTag, "Applying Pixel-specific battery optimization request")
+                        }
+                        else -> {
+                            Log.d(deviceTag, "Applying standard battery optimization request")
+                        }
+                    }
+
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                    intent.data = Uri.parse("package:$packageName")
+                    startActivity(intent)
+                } else {
+                    Log.d(deviceTag, "Battery optimization already disabled")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(deviceTag, "Error requesting battery optimization exemption: ${e.message}")
+            e.printStackTrace()
+        }
     }
 
     /**
@@ -586,7 +666,10 @@ class MainActivity : AppCompatActivity() {
                 socket?.receiveBufferSize = 4096  // 4KB receive buffer
                 socket?.sendBufferSize = 4096     // 4KB send buffer
 
-                setupStreams()  // Initialize input/output streams
+                // Initialize input/output streams with coroutines for ASAP integration
+                CoroutineScope(Dispatchers.IO).launch {
+                    setupStreams()
+                }
 
                 val clientAddress = client.inetAddress.hostAddress
                 updateStatus("Client connected: $clientAddress")
@@ -607,7 +690,7 @@ class MainActivity : AppCompatActivity() {
      * Called when this device is a client
      * Now includes proper socket configuration for reliable P2P communication
      */
-    private fun connectToServer(hostAddress: InetAddress) {
+    private fun connectToServer(hostAddress: InetAddress, retryCount: Int = 0) {
         try {
             Log.d(TAG, "Attempting to connect to server: ${hostAddress.hostAddress}:$PORT")
 
@@ -631,8 +714,13 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // Connect to the host with timeout
-            socket?.connect(InetSocketAddress(hostAddress, PORT), 10000) // 10 second timeout
+            // Connect to the host with device-specific timeout
+            val timeout = DeviceUtils.getSocketTimeout().toInt()
+            Log.d(deviceTag, "Using device-specific socket timeout: ${timeout}ms (attempt ${retryCount + 1})")
+
+            socket?.connect(InetSocketAddress(hostAddress, PORT), timeout)
+
+            Log.d(deviceTag, "Socket connection established successfully")
 
             if (socket?.isConnected == true) {
                 // Configure socket after successful connection for immediate message delivery
@@ -643,17 +731,43 @@ class MainActivity : AppCompatActivity() {
                 socket?.receiveBufferSize = 4096  // 4KB receive buffer
                 socket?.sendBufferSize = 4096     // 4KB send buffer
 
-                setupStreams()  // Initialize input/output streams
+                // Initialize input/output streams with coroutines for ASAP integration
+                CoroutineScope(Dispatchers.IO).launch {
+                    setupStreams()
+                }
                 updateStatus("Connected to server: ${hostAddress.hostAddress}")
                 Log.d(TAG, "Successfully connected to server: ${hostAddress.hostAddress}:$PORT")
 
                 // Start listening for incoming messages
                 listenForMessages()
             }
-        } catch (e: IOException) {
-            Log.e(TAG, "Client connection error: ${e.message}")
+        } catch (e: Exception) {
+            Log.e(deviceTag, "Client connection error (attempt ${retryCount + 1}): ${e.message}")
             e.printStackTrace()
-            updateStatus("Connection error: ${e.message}")
+
+            // Implement retry logic with exponential backoff
+            val maxRetries = DeviceUtils.getMaxRetries()
+            if (retryCount < maxRetries) {
+                val delay = min(
+                    (1000 * Math.pow(DeviceUtils.Config.RETRY_BACKOFF_MULTIPLIER, retryCount.toDouble())).toLong(),
+                    DeviceUtils.Config.MAX_RETRY_DELAY
+                )
+
+                Log.d(deviceTag, "Retrying connection in ${delay}ms (attempt ${retryCount + 1}/$maxRetries)")
+                updateStatus("Connection failed, retrying in ${delay}ms...")
+
+                Handler(Looper.getMainLooper()).postDelayed({
+                    thread(start = true) {
+                        connectToServer(hostAddress, retryCount + 1)
+                    }
+                }, delay)
+            } else {
+                Log.e(deviceTag, "Max connection retries ($maxRetries) exceeded")
+                updateStatus("Connection failed after $maxRetries attempts: ${e.message}")
+
+                // Clean up on final failure
+                closeConnection()
+            }
         }
     }
 
@@ -662,7 +776,7 @@ class MainActivity : AppCompatActivity() {
      * Using direct InputStream reading to eliminate BufferedReader delays
      * Now integrates with ASAP EncounterManager to handle the encounter
      */
-    private fun setupStreams() {
+    private suspend fun setupStreams() {
         try {
             Log.d(TAG, "Setting up direct streams for immediate socket communication")
 
@@ -683,18 +797,29 @@ class MainActivity : AppCompatActivity() {
 
                 Log.d(TAG, "Direct streams initialized successfully - ready for immediate communication")
 
-                // Notify ASAP EncounterManager about the new encounter
-                if (::encounterLayer.isInitialized && currentPeerAddress != null) {
-                    Log.d(TAG, "Notifying EncounterManager about new encounter with $currentPeerAddress")
-                    encounterLayer.handleEncounter(
-                        inputStream,
-                        outputStream,
-                        currentPeerAddress!!,
-                        ASAPEncounterConnectionType.AD_HOC_LAYER_2_NETWORK
-                    )
-                    Log.i(TAG, "EncounterManager notified about encounter with $currentPeerAddress")
-                } else {
-                    Log.w(TAG, "Cannot notify EncounterManager - layer not initialized or no peer address")
+                // Notify ASAP EncounterManager about the new encounter with device-specific handling
+                initializationMutex.withLock {
+                    if (::encounterLayer.isInitialized && currentPeerAddress != null && isAsapInitialized.get()) {
+                        Log.d(deviceTag, "Notifying EncounterManager about new encounter with $currentPeerAddress")
+
+                        // Add device-specific delay before ASAP encounter handling
+                        val delay = DeviceUtils.getAsapInitDelay()
+                        Log.d(deviceTag, "Applying device-specific ASAP delay: ${delay}ms")
+                        delay(delay)
+
+                        encounterLayer.handleEncounter(
+                            inputStream,
+                            outputStream,
+                            currentPeerAddress!!,
+                            ASAPEncounterConnectionType.AD_HOC_LAYER_2_NETWORK
+                        )
+                        Log.i(deviceTag, "EncounterManager notified about encounter with $currentPeerAddress")
+                    } else {
+                        Log.w(deviceTag, "Cannot notify EncounterManager - layer not ready or no peer address")
+                        Log.d(deviceTag, "  encounterLayer.isInitialized: ${::encounterLayer.isInitialized}")
+                        Log.d(deviceTag, "  isAsapInitialized: ${isAsapInitialized.get()}")
+                        Log.d(deviceTag, "  currentPeerAddress: $currentPeerAddress")
+                    }
                 }
             } else {
                 throw IOException("Failed to get input/output streams from socket")
@@ -917,9 +1042,10 @@ class MainActivity : AppCompatActivity() {
      * Helps prevent connection drops due to power management
      */
     private fun disableWifiPowerSaving() {
-        val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         val wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "MyApp:WifiLock")
         wifiLock.acquire()
+        Log.d(deviceTag, "WiFi power saving disabled with high-performance lock")
     }
 
     // ========== ACTIVITY LIFECYCLE METHODS ==========

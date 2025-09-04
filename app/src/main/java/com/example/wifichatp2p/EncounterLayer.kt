@@ -1,6 +1,7 @@
 package com.example.wifichatp2p
 
 import android.util.Log
+import android.os.Build
 import net.sharksystem.asap.ASAPConnectionHandler
 import net.sharksystem.asap.ASAPEncounterManager
 import net.sharksystem.asap.ASAPEncounterManagerImpl
@@ -13,6 +14,10 @@ import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
 
 /**
  * EncounterLayer wraps the ASAP EncounterManager functionality
@@ -28,13 +33,16 @@ import java.util.concurrent.ConcurrentHashMap
 class EncounterLayer(
     private val peerId: String,
     private val storageFolder: File,
-    private val cooldownPeriodMs: Long = 5000L // 5 seconds cooldown by default
+    private val cooldownPeriodMs: Long = 5000L, // 5 seconds cooldown by default
+    private val initDelayMs: Long = DeviceUtils.getAsapInitDelay()
 ) {
 
     companion object {
-        private const val TAG = "EncounterMgr"
+        private const val TAG = "EncounterLayer"
         private val SUPPORTED_FORMATS = setOf("chat", "p2p-message") // ASAP message formats
     }
+
+    private val deviceTag = "${TAG}_${Build.MANUFACTURER}_${Build.MODEL}"
 
     // ASAP components
     private var asapConnectionHandler: ASAPConnectionHandler? = null
@@ -42,41 +50,137 @@ class EncounterLayer(
 
     // Connection tracking
     private val activeConnections = ConcurrentHashMap<String, Long>()
-    private var isInitialized = false
+    private val isInitialized = AtomicBoolean(false)
+    private val initializationMutex = kotlinx.coroutines.sync.Mutex()
+    private var initializationJob: Job? = null
 
     /**
      * Initialize the ASAP peer and encounter manager
      * This should be called once during app startup
+     * Now includes device-specific delays and thread-safe initialization
      */
-    fun initialize(): Boolean {
-        return try {
-            Log.d(TAG, "Initializing ASAP EncounterLayer for peer: $peerId")
-            Log.d(TAG, "Storage folder: ${storageFolder.absolutePath}")
-            Log.d(TAG, "Cooldown period: ${cooldownPeriodMs}ms")
-
-            // Ensure storage folder exists
-            if (!storageFolder.exists()) {
-                storageFolder.mkdirs()
-                Log.d(TAG, "Created storage folder: ${storageFolder.absolutePath}")
+    suspend fun initialize(): Boolean {
+        return initializationMutex.withLock {
+            if (isInitialized.get()) {
+                Log.d(deviceTag, "EncounterLayer already initialized")
+                return@withLock true
             }
 
-            // Create ASAP connection handler (peer)
-            asapConnectionHandler = ASAPPeerFS(peerId, storageFolder.absolutePath, SUPPORTED_FORMATS)
-            Log.d(TAG, "ASAP peer created successfully")
+            try {
+                Log.d(deviceTag, "Initializing ASAP EncounterLayer for peer: $peerId")
+                Log.d(deviceTag, "Device: ${Build.MANUFACTURER} ${Build.MODEL}")
+                Log.d(deviceTag, "Storage folder: ${storageFolder.absolutePath}")
+                Log.d(deviceTag, "Cooldown period: ${cooldownPeriodMs}ms")
+                Log.d(deviceTag, "Init delay: ${initDelayMs}ms")
 
-            // Create encounter manager with cooldown period
-            encounterManager = ASAPEncounterManagerImpl(asapConnectionHandler, peerId, cooldownPeriodMs)
-            Log.d(TAG, "ASAP EncounterManager created with cooldown: ${cooldownPeriodMs}ms")
+                // Device-specific initialization delay
+                if (initDelayMs > 0) {
+                    Log.d(deviceTag, "Applying device-specific initialization delay: ${initDelayMs}ms")
+                    delay(initDelayMs)
+                }
 
-            isInitialized = true
-            Log.i(TAG, "EncounterLayer initialization completed successfully")
-            true
+                // Ensure storage folder exists
+                if (!storageFolder.exists()) {
+                    val created = storageFolder.mkdirs()
+                    if (created) {
+                        Log.d(deviceTag, "Created storage folder: ${storageFolder.absolutePath}")
+                    } else {
+                        Log.e(deviceTag, "Failed to create storage folder: ${storageFolder.absolutePath}")
+                        return@withLock false
+                    }
+                }
 
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize EncounterLayer: ${e.message}")
-            e.printStackTrace()
-            false
+                // Validate storage folder permissions
+                if (!storageFolder.canRead() || !storageFolder.canWrite()) {
+                    Log.e(deviceTag, "Storage folder permissions insufficient: ${storageFolder.absolutePath}")
+                    return@withLock false
+                }
+
+                Log.d(deviceTag, "Creating ASAP peer with formats: $SUPPORTED_FORMATS")
+
+                // Create ASAP connection handler (peer) with error handling
+                asapConnectionHandler = try {
+                    ASAPPeerFS(peerId, storageFolder.absolutePath, SUPPORTED_FORMATS)
+                } catch (e: Exception) {
+                    Log.e(deviceTag, "Failed to create ASAP peer: ${e.message}")
+                    e.printStackTrace()
+                    return@withLock false
+                }
+
+                Log.d(deviceTag, "ASAP peer created successfully")
+
+                // Create encounter manager with cooldown period
+                encounterManager = try {
+                    ASAPEncounterManagerImpl(asapConnectionHandler, peerId, cooldownPeriodMs)
+                } catch (e: Exception) {
+                    Log.e(deviceTag, "Failed to create ASAP EncounterManager: ${e.message}")
+                    e.printStackTrace()
+                    return@withLock false
+                }
+
+                Log.d(deviceTag, "ASAP EncounterManager created with cooldown: ${cooldownPeriodMs}ms")
+
+                // Additional device-specific validation for Pixel devices
+                if (DeviceUtils.getDeviceManufacturer() == DeviceUtils.DeviceManufacturer.GOOGLE_PIXEL) {
+                    Log.d(deviceTag, "Performing Pixel-specific ASAP validation")
+
+                    // Add small delay for Pixel devices to ensure proper initialization
+                    delay(100)
+
+                    // Validate that the encounter manager is properly initialized
+                    if (encounterManager == null) {
+                        Log.e(deviceTag, "Pixel validation failed: EncounterManager is null")
+                        return@withLock false
+                    }
+                }
+
+                isInitialized.set(true)
+                Log.i(deviceTag, "EncounterLayer initialization completed successfully")
+                true
+
+            } catch (e: Exception) {
+                Log.e(deviceTag, "Failed to initialize EncounterLayer: ${e.message}")
+                e.printStackTrace()
+
+                // Clean up partial initialization
+                cleanup()
+                false
+            }
         }
+    }
+
+    /**
+     * Initialize the EncounterLayer asynchronously in a background thread
+     * This is the main entry point for initialization from MainActivity
+     */
+    fun initializeAsync(callback: (Boolean) -> Unit) {
+        if (isInitialized.get()) {
+            Log.d(deviceTag, "EncounterLayer already initialized")
+            callback(true)
+            return
+        }
+
+        initializationJob = CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val success = initialize()
+                withContext(Dispatchers.Main) {
+                    callback(success)
+                }
+            } catch (e: Exception) {
+                Log.e(deviceTag, "Async initialization failed: ${e.message}")
+                e.printStackTrace()
+                withContext(Dispatchers.Main) {
+                    callback(false)
+                }
+            }
+        }
+    }
+
+    /**
+     * Check if the EncounterLayer is properly initialized
+     */
+    fun isReady(): Boolean {
+        return isInitialized.get() && encounterManager != null
     }
 
     /**
@@ -88,30 +192,30 @@ class EncounterLayer(
      * @return true if connection should be established, false otherwise
      */
     fun shouldCreateConnection(peerDeviceAddress: String, connectionType: ASAPEncounterConnectionType = ASAPEncounterConnectionType.AD_HOC_LAYER_2_NETWORK): Boolean {
-        if (!isInitialized) {
-            Log.w(TAG, "EncounterLayer not initialized, allowing connection by default")
+        if (!isInitialized.get()) {
+            Log.w(deviceTag, "EncounterLayer not initialized, allowing connection by default")
             return true
         }
 
         return try {
-            Log.d(TAG, "Checking if connection should be created to peer: $peerDeviceAddress")
-            Log.d(TAG, "Connection type: $connectionType")
+            Log.d(deviceTag, "Checking if connection should be created to peer: $peerDeviceAddress")
+            Log.d(deviceTag, "Connection type: $connectionType")
 
             // Check with ASAP EncounterManager
             val shouldConnect = encounterManager?.shouldCreateConnectionToPeer(peerDeviceAddress, connectionType) ?: true
 
-            Log.i(TAG, "EncounterManager decision for $peerDeviceAddress: $shouldConnect")
+            Log.i(deviceTag, "EncounterManager decision for $peerDeviceAddress: $shouldConnect")
 
             if (shouldConnect) {
-                Log.d(TAG, "Connection approved - no recent encounter with $peerDeviceAddress")
+                Log.d(deviceTag, "Connection approved - no recent encounter with $peerDeviceAddress")
             } else {
-                Log.d(TAG, "Connection rejected - recent encounter exists with $peerDeviceAddress (cooldown active)")
+                Log.d(deviceTag, "Connection rejected - recent encounter exists with $peerDeviceAddress (cooldown active)")
             }
 
             shouldConnect
 
         } catch (e: Exception) {
-            Log.e(TAG, "Error checking connection decision: ${e.message}")
+            Log.e(deviceTag, "Error checking connection decision: ${e.message}")
             e.printStackTrace()
             // Default to allowing connection on error
             true
@@ -133,35 +237,56 @@ class EncounterLayer(
         peerDeviceAddress: String,
         connectionType: ASAPEncounterConnectionType = ASAPEncounterConnectionType.AD_HOC_LAYER_2_NETWORK
     ) {
-        if (!isInitialized) {
-            Log.w(TAG, "EncounterLayer not initialized, skipping encounter handling")
+        if (!isInitialized.get()) {
+            Log.w(deviceTag, "EncounterLayer not initialized, skipping encounter handling")
             return
         }
 
         try {
-            Log.d(TAG, "Handling new encounter with peer: $peerDeviceAddress")
-            Log.d(TAG, "Connection type: $connectionType")
+            Log.d(deviceTag, "Handling new encounter with peer: $peerDeviceAddress")
+            Log.d(deviceTag, "Connection type: $connectionType")
+            Log.d(deviceTag, "Device: ${Build.MANUFACTURER} ${Build.MODEL}")
 
             // Create StreamPair from the input/output streams
-            val streamPair = StreamPairImpl.getStreamPair(inputStream, outputStream)
-            Log.d(TAG, "StreamPair created successfully")
+            val streamPair = try {
+                StreamPairImpl.getStreamPair(inputStream, outputStream)
+            } catch (e: Exception) {
+                Log.e(deviceTag, "Failed to create StreamPair: ${e.message}")
+                e.printStackTrace()
+                return
+            }
+
+            Log.d(deviceTag, "StreamPair created successfully")
 
             // Optional: Set up idle connection closer (closes connection if idle for 30 seconds)
-            val idleCloser = IdleStreamPairCloser.getIdleStreamsCloser(streamPair, 30000)
-            idleCloser.start()
-            Log.d(TAG, "Idle stream closer started (30s timeout)")
+            val idleCloser = try {
+                IdleStreamPairCloser.getIdleStreamsCloser(streamPair, 30000)
+            } catch (e: Exception) {
+                Log.w(deviceTag, "Failed to create idle stream closer: ${e.message}")
+                null
+            }
+
+            idleCloser?.start()
+            Log.d(deviceTag, "Idle stream closer started (30s timeout)")
 
             // Notify encounter manager about the new encounter
-            encounterManager?.handleEncounter(streamPair, connectionType)
+            try {
+                encounterManager?.handleEncounter(streamPair, connectionType)
+                Log.d(deviceTag, "EncounterManager.handleEncounter() completed successfully")
+            } catch (e: Exception) {
+                Log.e(deviceTag, "EncounterManager.handleEncounter() failed: ${e.message}")
+                e.printStackTrace()
+                // Continue with connection tracking even if ASAP handling fails
+            }
 
             // Track the connection locally
             activeConnections[peerDeviceAddress] = System.currentTimeMillis()
 
-            Log.i(TAG, "Encounter handling completed for peer: $peerDeviceAddress")
-            Log.d(TAG, "Active connections count: ${activeConnections.size}")
+            Log.i(deviceTag, "Encounter handling completed for peer: $peerDeviceAddress")
+            Log.d(deviceTag, "Active connections count: ${activeConnections.size}")
 
         } catch (e: Exception) {
-            Log.e(TAG, "Error handling encounter with $peerDeviceAddress: ${e.message}")
+            Log.e(deviceTag, "Error handling encounter with $peerDeviceAddress: ${e.message}")
             e.printStackTrace()
         }
     }
@@ -172,12 +297,12 @@ class EncounterLayer(
      * @param peerDeviceAddress The identifier of the disconnected peer
      */
     fun onConnectionClosed(peerDeviceAddress: String) {
-        Log.d(TAG, "Connection closed with peer: $peerDeviceAddress")
+        Log.d(deviceTag, "Connection closed with peer: $peerDeviceAddress")
 
         // Remove from active connections
         activeConnections.remove(peerDeviceAddress)
-        Log.d(TAG, "Removed $peerDeviceAddress from active connections")
-        Log.d(TAG, "Remaining active connections: ${activeConnections.size}")
+        Log.d(deviceTag, "Removed $peerDeviceAddress from active connections")
+        Log.d(deviceTag, "Remaining active connections: ${activeConnections.size}")
     }
 
     /**
@@ -201,17 +326,28 @@ class EncounterLayer(
      * Should be called when the app is shutting down
      */
     fun cleanup() {
-        Log.d(TAG, "Cleaning up EncounterLayer resources")
+        Log.d(deviceTag, "Cleaning up EncounterLayer resources")
 
         try {
+            // Cancel any ongoing initialization
+            initializationJob?.cancel()
+
             activeConnections.clear()
+
+            // Reset initialization state
+            isInitialized.set(false)
+
+            // Clear references
+            asapConnectionHandler = null
+            encounterManager = null
+
             // Note: ASAPEncounterManager doesn't have explicit cleanup method
             // The underlying resources will be garbage collected
 
-            Log.i(TAG, "EncounterLayer cleanup completed")
+            Log.i(deviceTag, "EncounterLayer cleanup completed")
 
         } catch (e: Exception) {
-            Log.e(TAG, "Error during cleanup: ${e.message}")
+            Log.e(deviceTag, "Error during cleanup: ${e.message}")
             e.printStackTrace()
         }
     }
@@ -220,7 +356,7 @@ class EncounterLayer(
      * Get current status for debugging and monitoring
      */
     fun getStatus(): String {
-        return if (isInitialized) {
+        return if (isInitialized.get()) {
             "Initialized - Peer: $peerId, Cooldown: ${cooldownPeriodMs}ms, Active: ${activeConnections.size}"
         } else {
             "Not initialized"
