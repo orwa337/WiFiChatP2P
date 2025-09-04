@@ -1,10 +1,13 @@
 # WiFiChatP2P
-This is an Android chat app passed on Wi-Fi Driect \
-![Screen shot](images/Screenshot_WiFiChatP2P.jpg) \
+This is an Android chat app passed on Wi-Fi Driect 
+
+<p align="center">
+  <img src="images/Screenshot_WiFiChatP2P.jpg" alt="Screen shot" />
+</p>
 
 Pixel issues:\
 
-- Delay in receiving messages on the client side \
-- Unstable connection \
+- Delay in receiving messages on the client side 
+- Unstable connection 
 
 Check Also The Brunch ASAP Encounter
